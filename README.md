@@ -18,7 +18,8 @@ Requirements:
 - Python 3.11
 - [uv](https://docs.astral.sh/uv/)
 - FFmpeg shared libraries, which torchcodec needs to decode audio and video (`apt install ffmpeg`)
-- An NVIDIA GPU. CPU should work but is untested and will be much slower.
+- An NVIDIA GPU. It also runs on CPU (`DEVICE=cpu`) with identical results, but far slower for images and
+  video; see [Running on CPU](#running-on-cpu).
 
 ```bash
 uv venv --python 3.11 .venv
@@ -349,3 +350,21 @@ Images gain little from batching because the GPU is already fully busy: each ima
 the vision encoder, and almost all the time is spent in the encoder's matrix maths. Faster number formats
 don't help on this card either: it has no native bfloat16, and float16 breaks this model. On a GPU with
 bfloat16 support (Ampere or newer), `DTYPE=bfloat16` should be noticeably faster, but that's untested here.
+
+### Running on CPU
+
+With `DEVICE=cpu` everything works and the vectors match the GPU's (cosine similarity 1.000000 for every input
+type). It's practical for text, but slow for media. Measured on a 16-core CPU, float32, one request at a time:
+
+| Input | CPU | GPU (TITAN RTX) |
+|---|---|---|
+| Short text | ~0.1 s | ~0.05 s |
+| 64 texts in one batch | 1.7 s (38 per second) | 0.08 s (845 per second) |
+| One image | ~7 s | ~0.25 s |
+| 3-second audio clip | 1.5 s | 0.3 s |
+| 60-second audio clip | 10 s | 0.4 s |
+| 10-second video (10 frames) | 33 s | 0.8 s |
+| 60-second video (58 frames) | ~3.5 minutes | 4.5 s |
+
+Requests are handled one at a time, so a long video blocks everything behind it for minutes. Make sure clients'
+HTTP timeouts allow for that. The CPU server uses about 4.3 GB of RAM. Keep `DTYPE=float32` on CPU.
