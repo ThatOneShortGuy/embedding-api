@@ -1,0 +1,23 @@
+# Template, not installable as-is: `just install-service` replaces @USER@ with the user running it
+# and @DIR@ with this project's directory, then installs the result to /etc/systemd/system.
+
+[Unit]
+Description=EmbeddingGemma API
+# The model downloads from Hugging Face on first start
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+ExecStart=@DIR@/.venv/bin/python app.py
+# Send print/log output to the journal immediately
+Environment=PYTHONUNBUFFERED=1
+# Settings (HOST, PORT, DEVICE, DTYPE, ...); see .env.example
+EnvironmentFile=-@DIR@/.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
