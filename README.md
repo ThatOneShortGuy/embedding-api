@@ -303,6 +303,7 @@ environment override `.env`, and an empty value means "use the default".
 | `MAX_TOKENS` | `8192` | Token budget per input (per request for `/embed`, per item for `/embed/batch`). Raising it lets inputs run past what the model was trained on, and uses more GPU memory. |
 | `BATCH_TOKENS` | `16384` | Most tokens in one GPU batch (items × longest item). ~8 GB of GPU memory for images at the default. Lower it on smaller GPUs. |
 | `MAX_BATCH_ITEMS` | `256` | Most items in one `/embed/batch` request |
+| `IDLE_CACHE_MB` | `1024` | Most cached, unused GPU memory kept after a request. Above it, the cache is given back to the GPU. See [Notes](#notes). |
 | `HF_TOKEN`, `HF_HOME` | unset | Optional Hugging Face download token and model cache location |
 
 Write `.env` as plain `KEY=value` lines with comments on their own lines: the systemd service reads the same
@@ -329,9 +330,12 @@ The `detail` field explains what went wrong.
 - **One request uses the GPU at a time.** Concurrent requests are accepted, but they queue for the GPU
   instead of running together, so several large requests at once don't run out of memory. To get more
   throughput, send batches, not parallel requests.
-- **GPU memory isn't given back.** PyTorch keeps memory it has used reserved for reuse, so after large requests
-  `nvidia-smi` can show ~18 GB in use while the server is idle. That's expected on a GPU dedicated to this
-  server, but it leaves little room for other programs on the same GPU.
+- **GPU memory is given back after large requests.** PyTorch keeps memory it has used reserved for reuse.
+  After each request, if more than `IDLE_CACHE_MB` (1 GB by default) is cached but unused, the server returns
+  it to the GPU, so idle usage settles near the model's ~3.3 GB instead of staying at ~18 GB after a large
+  batch. Small requests stay under the threshold and keep reusing their cache. Peak usage during a request is
+  unchanged: a full batch still needs ~8 GB on top of the model, and fails with `503` if another program has
+  taken that memory.
 
 ## Performance
 

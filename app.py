@@ -60,6 +60,7 @@ DTYPE = _DTYPES[env("DTYPE", "float32")]
 MAX_TOKENS = int(env("MAX_TOKENS", "8192"))
 BATCH_TOKENS = int(env("BATCH_TOKENS", "16384"))
 MAX_BATCH_ITEMS = int(env("MAX_BATCH_ITEMS", "256"))
+IDLE_CACHE_MB = int(env("IDLE_CACHE_MB", "1024"))
 
 # Fixed properties of the model and its processors, not settings.
 Dimensions = Literal[768, 512, 256, 128]  # Matryoshka sizes the model was trained for
@@ -439,27 +440,44 @@ def encode_all(prepared: list[Prepared], dimensions: int, normalize: bool) -> li
         chunks.append((cap, chunk))
 
     with GPU_LOCK:
-        for cap, chunk in chunks:
-            processing = {"audio": {"max_length": AUDIO_MAX_SAMPLES}}
-            if cap is not None:
-                processing["video"] = {"max_frames": cap}
-            try:
-                embs = model.encode(
-                    [prepared[i].sample for i in chunk],
-                    batch_size=len(chunk),
-                    truncate_dim=dimensions,
-                    # Applied after truncate_dim, so shortened vectors come back unit length too.
-                    normalize_embeddings=normalize,
-                    processing_kwargs=processing,
-                )
-            except torch.cuda.OutOfMemoryError as e:
-                torch.cuda.empty_cache()
-                raise HTTPException(503, "GPU ran out of memory; try a smaller request") from e
-            except ValueError as e:
-                raise HTTPException(400, f"Could not embed input: {e}") from e
-            for i, emb in zip(chunk, embs):
-                results[i] = emb.tolist()
+        try:
+            for cap, chunk in chunks:
+                processing = {"audio": {"max_length": AUDIO_MAX_SAMPLES}}
+                if cap is not None:
+                    processing["video"] = {"max_frames": cap}
+                try:
+                    embs = model.encode(
+                        [prepared[i].sample for i in chunk],
+                        batch_size=len(chunk),
+                        truncate_dim=dimensions,
+                        # Applied after truncate_dim, so shortened vectors come back unit length too.
+                        normalize_embeddings=normalize,
+                        processing_kwargs=processing,
+                    )
+                except torch.cuda.OutOfMemoryError as e:
+                    torch.cuda.empty_cache()
+                    raise HTTPException(503, "GPU ran out of memory; try a smaller request") from e
+                except ValueError as e:
+                    raise HTTPException(400, f"Could not embed input: {e}") from e
+                for i, emb in zip(chunk, embs):
+                    results[i] = emb.tolist()
+        finally:
+            trim_gpu_cache()
     return results
+
+
+def trim_gpu_cache() -> None:
+    """Return PyTorch's cached GPU memory to the driver once it exceeds IDLE_CACHE_MB.
+
+    PyTorch keeps freed memory reserved for reuse, so one large request would otherwise hold
+    several GB while idle. Releasing only above a threshold lets small requests keep reusing
+    their cache, avoiding the cost of reallocating from the driver on every request.
+    """
+    if not DEVICE.startswith("cuda"):
+        return
+    cached = torch.cuda.memory_reserved(DEVICE) - torch.cuda.memory_allocated(DEVICE)
+    if cached > IDLE_CACHE_MB * 2**20:
+        torch.cuda.empty_cache()
 
 
 def parse_options(model_cls, request: str | UploadFile | None):
