@@ -9,9 +9,12 @@ Returns {"modality": ..., "dimensions": N, "embedding": [floats]}.
 
 POST /embed/batch  many items per request, for throughput. See README.md.
 
+POST /v1/embeddings  OpenAI-compatible, text only, for clients built on the OpenAI API.
+
 Run: .venv/bin/python app.py  (settings come from the environment or .env; see .env.example)
 """
 
+import base64
 import math
 import os
 import shutil
@@ -29,6 +32,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).with_name(".env"))
 
 import av
+import numpy as np
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.openapi.utils import get_openapi
@@ -60,6 +64,7 @@ DTYPE = _DTYPES[env("DTYPE", "float32")]
 MAX_TOKENS = int(env("MAX_TOKENS", "8192"))
 BATCH_TOKENS = int(env("BATCH_TOKENS", "16384"))
 MAX_BATCH_ITEMS = int(env("MAX_BATCH_ITEMS", "256"))
+OPENAI_MAX_INPUTS = 2048  # OpenAI's own per-request limit, so its clients never need to split
 IDLE_CACHE_MB = int(env("IDLE_CACHE_MB", "1024"))
 
 # Fixed properties of the model and its processors, not settings.
@@ -232,6 +237,48 @@ class BatchResult(BaseModel):
 class BatchResponse(BaseModel):
     dimensions: int = Field(description="Length of every `embedding`.", examples=[768])
     results: list[BatchResult] = Field(description="One result per item, in the order the items were sent.")
+
+
+class OpenAIEmbeddingRequest(BaseModel):
+    """OpenAI's embeddings request, text only. `model` and `user` are accepted and ignored."""
+
+    input: str | list[str] = Field(
+        description="Text to embed, or a list of texts (one vector each, up to 2048). Token-ID input isn't supported.",
+        examples=["waterproof trail shoes"],
+    )
+    model: str | None = Field(None, description="Ignored; this server has one model.")
+    encoding_format: Literal["float", "base64"] = Field(
+        "float",
+        description="`base64` returns each vector as little-endian float32 bytes. The official OpenAI clients "
+        "request this by default and decode it for you.",
+    )
+    dimensions: Dimensions = Field(768, description="Length of the returned vectors.")
+    user: str | None = Field(None, description="Ignored.")
+    prompt_name: str | None = Field(
+        "Document",
+        description="Not part of OpenAI's API. Task prefix for every input, as in /embed. The default embeds "
+        "everything as a document; send a query prompt (e.g. `SearchQuery`, via `extra_body` in the OpenAI "
+        "clients) when embedding search queries, or `null` for none.",
+        examples=["SearchQuery"],
+    )
+
+
+class OpenAIEmbedding(BaseModel):
+    object: Literal["embedding"] = "embedding"
+    index: int
+    embedding: list[float] | str = Field(description="Unit-length vector, or base64 float32 bytes of it.")
+
+
+class OpenAIUsage(BaseModel):
+    prompt_tokens: int
+    total_tokens: int
+
+
+class OpenAIEmbeddingResponse(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[OpenAIEmbedding]
+    model: str
+    usage: OpenAIUsage
 
 
 class ErrorResponse(BaseModel):
@@ -584,6 +631,40 @@ def embed_batch(
     return {
         "dimensions": opts.dimensions,
         "results": [{"modality": p.modality, "embedding": e} for p, e in zip(prepared, embeddings)],
+    }
+
+
+@app.post(
+    "/v1/embeddings",
+    response_model=OpenAIEmbeddingResponse,
+    responses=ERROR_RESPONSES,
+    summary="OpenAI-compatible text embeddings",
+    description="Drop-in for OpenAI's `POST /v1/embeddings`, so OpenAI clients and tools work with "
+    "`base_url=http://host:11433/v1` and any API key. Text only. Vectors are unit length, as OpenAI's are.\n\n"
+    "```\ncurl host:11433/v1/embeddings -H 'Content-Type: application/json' -d '{\"input\": [\"a\", \"b\"]}'\n```",
+)
+def openai_embeddings(req: OpenAIEmbeddingRequest):
+    texts = [req.input] if isinstance(req.input, str) else req.input
+    if not 1 <= len(texts) <= OPENAI_MAX_INPUTS:
+        raise HTTPException(400, f"input must contain between 1 and {OPENAI_MAX_INPUTS} texts")
+
+    with ExitStack() as stack:
+        prepared = []
+        for i, text in enumerate(texts):
+            try:
+                prepared.append(prepare(format_text(text, req.prompt_name, None), {}, stack))
+            except HTTPException as e:
+                detail = {**e.detail, "item": i} if isinstance(e.detail, dict) else f"input[{i}]: {e.detail}"
+                raise HTTPException(e.status_code, detail) from e
+        embeddings = encode_all(prepared, req.dimensions, normalize=True)
+
+    if req.encoding_format == "base64":
+        embeddings = [base64.b64encode(np.asarray(e, dtype="<f4").tobytes()).decode() for e in embeddings]
+    tokens = sum(p.tokens for p in prepared)
+    return {
+        "data": [{"index": i, "embedding": e} for i, e in enumerate(embeddings)],
+        "model": MODEL_ID,
+        "usage": {"prompt_tokens": tokens, "total_tokens": tokens},
     }
 
 

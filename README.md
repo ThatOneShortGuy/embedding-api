@@ -197,6 +197,46 @@ A batch can hold up to 256 items. The server splits it into GPU batches of at mo
 each item as long as the longest item in its GPU batch, which keeps memory use bounded. A batch of many large
 items is therefore processed a few items at a time; it still works, just without much speedup.
 
+### `POST /v1/embeddings`
+
+OpenAI-compatible text embeddings, so tools and libraries built on the OpenAI API can use this server: point them
+at `base_url=http://localhost:11433/v1` with any API key. Text only.
+
+```bash
+curl localhost:11433/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input": ["first document", "second document"]}'
+```
+
+```json
+{"object": "list",
+ "data": [{"object": "embedding", "index": 0, "embedding": [...]},
+          {"object": "embedding", "index": 1, "embedding": [...]}],
+ "model": "google/embeddinggemma-2",
+ "usage": {"prompt_tokens": 8, "total_tokens": 8}}
+```
+
+Python, with the `openai` package:
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:11433/v1", api_key="unused")
+resp = client.embeddings.create(model="embeddinggemma", input=["first document", "second document"])
+vectors = [d.embedding for d in resp.data]
+```
+
+- `input` is a string or a list of up to 2,048 strings. Token-ID input isn't supported.
+- `dimensions` takes 768 (default), 512, 256 or 128. `encoding_format` takes `float` or `base64`; the official
+  OpenAI clients request `base64` and decode it themselves.
+- Vectors are always unit length, as OpenAI's are, so a dot product gives cosine similarity.
+- `model` and `user` are accepted and ignored.
+- Every input is formatted as a document (`prompt_name: "Document"`), since OpenAI's API has no way to say whether
+  text is a query or a document. A client that can tell may send the extra field `prompt_name` (with the OpenAI
+  Python client, `extra_body={"prompt_name": "SearchQuery"}`), or `null` for no prefix. See
+  [Text formatting](#text-formatting).
+
+Each input gets the same vector `/embed` returns for that text with the same `prompt_name` and `"normalize": true`,
+and follows the same 8,192-token budget. Errors use this server's format (see [Errors](#errors)), not OpenAI's.
+
 ## Supported files
 
 The type comes from the file extension (case doesn't matter):
@@ -316,7 +356,7 @@ file, and systemd doesn't support comments after a value.
 | `400` | Nothing to embed, invalid `request` JSON, unknown `prompt_name`, bad `dimensions`, placeholder count mismatch, or a file that can't be decoded. For batches also: too many or no items, duplicate filenames, a missing file, or an unused file. |
 | `413` | Over the token budget |
 | `415` | File extension not supported |
-| `422` | `/embed/batch` called without a `request` part |
+| `422` | `/embed/batch` called without a `request` part, or a `/v1/embeddings` body that isn't valid (e.g. bad `dimensions` or `encoding_format`) |
 | `503` | GPU ran out of memory |
 
 The `detail` field explains what went wrong.
